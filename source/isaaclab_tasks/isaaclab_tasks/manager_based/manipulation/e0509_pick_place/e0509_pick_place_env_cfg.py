@@ -220,12 +220,12 @@ class E0509PickPlaceSceneCfg(InteractiveSceneCfg):
     # offset: gripper base에서 end_effector_mesh까지 거리
     ee_frame = FrameTransformerCfg(
         prim_path="{ENV_REGEX_NS}/Robot/e0509/gripper/gripper/base",  # gripper base가 reference
-        debug_vis=False,  # 시각화 켜서 offset 확인
+        debug_vis= False,  # 시각화 켜서 offset 확인
         target_frames=[
             FrameTransformerCfg.FrameCfg(
                 prim_path="{ENV_REGEX_NS}/Robot/e0509/gripper/gripper/base",  # 자기자신
                 name="end_effector",
-                offset=OffsetCfg(pos=(0.0, -0.15, 0.0)),  # base에서 end_effector_mesh까지 Z방향 13cm (추정)
+                offset=OffsetCfg(pos=(0.0, -0.2, 0.0)),  # base에서 end_effector_mesh까지 Z방향 13cm (추정)
             ),
         ],
     )
@@ -255,16 +255,6 @@ class ActionsCfg:
         joint_names=["joint_[1-6]"],
         scale=0.05,  # Very small - slow, precise movements to prevent trembling
         use_default_offset=True,
-    )
-
-    # Gripper action: 1 action controls all 4 mimic joints
-    # PPO outputs 1 value in [-1, +1] -> broadcasts to all 4 gripper joints in [0, 1.1] range
-    # Total action space: 6 (arm) + 1 (gripper) = 7 DOF (same as before!)
-    gripper_action = MimicGripperActionCfg(
-        asset_name="robot",
-        joint_names=["rh_.*"],  # All 4 gripper joints: rh_l1, rh_l2, rh_r1_joint, rh_r2
-        scale=0.55,  # Maps [-1,+1] -> [-0.55, +0.55]
-        offset=0.55,  # Shifts to [0, 1.1] range! -1→0 (open), +1→1.1 (close)
     )
 
 
@@ -302,10 +292,10 @@ class RewardsCfg:
     # pregrasp_height=0.15 -> 물체 위 15cm 공중을 목표로 함 (충돌 방지)
     approach_and_orient = RewTerm(
         func=e0509_mdp.approach_and_orient_reward,
-        weight=10.0,  # 5.0 → 10.0 (방향 중요성 강조)
+        weight=20.0,  # 10.0 → 20.0 (자세 학습 강화!)
         params={
             "pregrasp_height": 0.15,  # [중요] 0.0 아님! 공중부양 유도
-            "orientation_strictness": 4.0,  # 2.0 → 4.0 (더 엄격하게)
+            "orientation_strictness": 8.0,  # 4.0 → 8.0 (훨씬 더 엄격하게!)
             "object_cfg": SceneEntityCfg("medicine_cabinet"),
         },
     )
