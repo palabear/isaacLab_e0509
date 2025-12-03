@@ -200,6 +200,7 @@ offset: (0.0, -0.15, 0.0)  # Y축 조정하여 정확한 위치 맞추기
 BSD-3 License (Isaac Lab)
 
 ## 참고
+- 안녕하세요
 
 - [Isaac Lab Documentation](https://isaac-sim.github.io/IsaacLab)
 - [Reinforcement Learning Guide](https://isaac-sim.github.io/IsaacLab/main/source/overview/reinforcement-learning/rl_existing_scripts.html)
