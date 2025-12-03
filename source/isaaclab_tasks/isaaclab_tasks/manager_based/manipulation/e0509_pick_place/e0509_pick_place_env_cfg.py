@@ -292,10 +292,10 @@ class RewardsCfg:
     # pregrasp_height=0.15 -> 물체 위 15cm 공중을 목표로 함 (충돌 방지)
     approach_and_orient = RewTerm(
         func=e0509_mdp.approach_and_orient_reward,
-        weight=20.0,  # 10.0 → 20.0 (자세 학습 강화!)
+        weight=10.0,  # 5.0 → 10.0 (방향 중요성 강조)
         params={
             "pregrasp_height": 0.15,  # [중요] 0.0 아님! 공중부양 유도
-            "orientation_strictness": 8.0,  # 4.0 → 8.0 (훨씬 더 엄격하게!)
+            "orientation_strictness": 4.0,  # 2.0 → 4.0 (더 엄격하게)
             "object_cfg": SceneEntityCfg("medicine_cabinet"),
         },
     )
