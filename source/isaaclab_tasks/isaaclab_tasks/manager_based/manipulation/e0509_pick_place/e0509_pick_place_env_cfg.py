@@ -253,7 +253,7 @@ class ActionsCfg:
     arm_action = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["joint_[1-6]"],
-        scale=0.05,  # Very small - slow, precise movements to prevent trembling
+        scale=0.1,  # Very slow for visualization (original: 0.1)
         use_default_offset=True,
     )
 
@@ -288,51 +288,28 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
     
-    # 1. 접근 및 자세 (가장 기본)
-    # pregrasp_height=0.15 -> 물체 위 15cm 공중을 목표로 함 (충돌 방지)
-    approach_and_orient = RewTerm(
-        func=e0509_mdp.approach_and_orient_reward,
-        weight=10.0,  # 5.0 → 10.0 (방향 중요성 강조)
+    # 1. XY-Z 분리 거리 보상
+    distance_reward = RewTerm(
+        func=e0509_mdp.object_ee_distance_separate,
+        weight=10.0,  # Increased weight to encourage reaching
         params={
-            "pregrasp_height": 0.15,  # [중요] 0.0 아님! 공중부양 유도
-            "orientation_strictness": 4.0,  # 2.0 → 4.0 (더 엄격하게)
+            "std_xy": 1.0,  # Wider range for XY
+            "std_z": 1.0,   # Wider range for Z
             "object_cfg": SceneEntityCfg("medicine_cabinet"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
         },
     )
     
-    # 2. 그리퍼 제어 (전략적)
-    # 가까이 가면 닫고, 멀면 염
-    grasp_encourage = RewTerm(
-        func=e0509_mdp.gripper_close_encourage,
-        weight=5.0,
+    # 2. 그리퍼 수평 자세
+    orientation_reward = RewTerm(
+        func=e0509_mdp.gripper_horizontal,
+        weight=1.0,  # Reduced to not override distance reward
         params={
-            "switch_dist": 0.04,  # 4cm 앞에서 닫기 시작
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
         },
     )
     
-    # 3. 최종 성공 (Jackpot)
-    # 성공 시 아주 큰 점수를 줘서, 앞의 과정들이 의미 있음을 알려줌
-    lift_success = RewTerm(
-        func=e0509_mdp.lift_success_bonus,
-        weight=25.0, # 성공 보상은 무조건 커야 함
-        params={
-            "lift_height": 0.05, 
-            "gripper_threshold": 0.5,
-        },
-    )
-    
-    # 4. 페널티 (최소화)
-    # 너무 세게 때리는 것만 방지
-    object_stability = RewTerm(
-        func=e0509_mdp.object_stability_penalty,
-        weight=-2.0,
-        params={
-            "velocity_threshold": 0.15,
-            "safe_distance": 0.10,
-        },
-    )
-    
-    # 5. 동작 안정화
+    # 3. 동작 평활화
     action_rate = RewTerm(
         func=mdp.action_rate_l2, 
         weight=-0.01,
@@ -345,18 +322,11 @@ class TerminationsCfg:
     # Episode timeout
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     
-    # Object out of bounds (fell off table or flew away)
-    object_out_of_bounds = DoneTerm(
-        func=e0509_mdp.object_out_of_bounds,
-        params={"x_limit": 1.5, "y_limit": 1.5, "z_min": -1.2, "z_max": 0.5},
-    )
-    
-    # 로봇팔-물체 충돌 (그리퍼 제외)
-    arm_collision = DoneTerm(
-        func=e0509_mdp.arm_object_collision,
+    # Object fell below table - using local termination function
+    object_dropped = DoneTerm(
+        func=e0509_mdp.object_collision_termination,
         params={
-            "force_threshold": 5.0,  # 5N 이상의 힘 감지 시 충돌
-            "contact_sensor_cfg": SceneEntityCfg("contact_forces"),
+            "min_height": -1.05,
         },
     )
 

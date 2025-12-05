@@ -1,196 +1,147 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
+#
 # SPDX-License-Identifier: BSD-3-Clause
-
-"""Reward functions for the e0509 pick and place task.
-
-[개선된 철학: Soft Guidance]
-1. Approach: 곱하기(*) 대신 더하기(+)를 사용하여, 자세가 나빠도 일단 접근하면 보상을 줌.
-2. Target: 물체 중심(0.0)이 아니라 공중(Pre-grasp)을 목표로 설정.
-3. Grasp: 가까우면 닫고, 멀면 여는 전략 유도.
-"""
-
 from __future__ import annotations
-
 import torch
 from typing import TYPE_CHECKING
-
-from isaaclab.assets import RigidObject, Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
-
+from isaaclab.utils.math import combine_frame_transforms, matrix_from_quat
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-def approach_pregrasp_pose(
+def object_ee_distance_separate(
     env: ManagerBasedRLEnv,
-    pregrasp_height: float = 0.15,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("medicine_cabinet"),
+    std_xy: float,
+    std_z: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """
-    거리 보상: 물체 위 'Pre-grasp' 지점까지의 거리
-    반환: exp(-distance) [0~1]
-    """
+    """Reward agent: first reward z-lift, then reward xy positioning."""
     object: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    
-    # 1. 목표 지점 계산 (물체 위치 + Z축 오프셋)
-    object_pos = object.data.root_pos_w[:, :3].clone()
-    object_pos[:, 2] += pregrasp_height  # 물체 머리 위로 목표 설정
-    
-    # 2. EE 위치
-    ee_pos = ee_frame.data.target_pos_w[..., 0, :]
-    
-    # 3. 거리 계산
-    distance = torch.norm(ee_pos - object_pos, dim=1)
-    
-    # 4. 보상 변환 (Log-scale과 유사한 깔때기)
-    # 가까울수록 점수가 급격히 오름
-    reward = torch.exp(-distance * 3.0) 
-    
-    return torch.clamp(reward, 0.0, 1.0)
+    cube_pos_w = object.data.root_pos_w
+    ee_pos_w = ee_frame.data.target_pos_w[..., 0, :]
+    delta = cube_pos_w - ee_pos_w
+    dx, dy, dz = delta[:, 0], delta[:, 1], delta[:, 2]
+    # XY 평면 Gaussian 보상
+    reward_xy = torch.exp(-(dx**2 + dy**2) / (2 * std_xy**2))
+    # Z Gaussian 보상 (XY 가까워야 의미 있음)
+    reward_z = torch.exp(-(dz**2) / (2 * std_z**2))
+    # 최종 보상
+    reward = reward_xy * reward_z
+    return reward
+def spoon_gripper_perpendicular(  # 숟가락과 그리퍼 수직 정도 계산 함수
+    env: ManagerBasedRLEnv,  # 환경
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),  # 물체(숟가락) 설정
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame")  # 엔드 이펙터(그리퍼) 설정
+) -> torch.Tensor:  # 반환 타입: 토치 텐서
+    """숟가락의 x축과 그리퍼 close 축(gripper x축)이 수직일 때 보상을 준다.
+    두 벡터의 외적을 이용하여 수직 정도를 계산한다.
+    - 외적의 크기가 크면 두 축이 수직 (보상 증가)
+    - 외적의 크기가 작으면 두 축이 평행 (보상 감소)
+    """
+    # 환경에서 물체 객체 가져오기
+    object: RigidObject = env.scene[object_cfg.name]  # 씬에서 물체 가져오기
+    # 환경에서 엔드 이펙터 객체 가져오기
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]  # 씬에서 엔드 이펙터 가져오기
+    # 숟가락의 쿼터니언을 회전 행렬로 변환하여 x축 벡터 추출
+    spoon_quat = object.data.root_quat_w  # 숟가락 쿼터니언 (환경 수, 4)
+    spoon_rot_matrix = matrix_from_quat(spoon_quat)  # 회전 행렬로 변환 (환경 수, 3, 3)
+    spoon_x_world = spoon_rot_matrix[:, 0, :]  # 회전 행렬의 첫 번째 열 (x축)
+    # 그리퍼의 쿼터니언을 회전 행렬로 변환하여 x축 벡터 추출
+    gripper_quat = ee_frame.data.target_quat_w  # 그리퍼 쿼터니언 (환경 수, 타겟 수, 4)
+    gripper_quat = gripper_quat[:, 0, :]  # 첫 번째 타겟만 선택 (환경 수, 4)
+    gripper_rot_matrix = matrix_from_quat(gripper_quat)  # 회전 행렬로 변환 (환경 수, 3, 3)
+    gripper_x_world = gripper_rot_matrix[:, 0, :]  # 회전 행렬의 첫 번째 열 (x축)
+    # 숟가락 x축을 정규화
+    spoon_x_world = torch.nn.functional.normalize(spoon_x_world, dim=-1)  # 숟가락 벡터 정규화
+    # 그리퍼 x축을 정규화
+    gripper_x_world = torch.nn.functional.normalize(gripper_x_world, dim=-1)  # 그리퍼 벡터 정규화
+    # 두 벡터의 내적 계산 (코사인 유사도)
+    dot = (spoon_x_world * gripper_x_world).sum(dim=-1)  # 내적 계산
+    # 직교 정도를 보상으로 변환 (수직일수록 보상 증가)
+    reward = 1.0 - torch.abs(dot)  # 보상 = 1 - |내적| (0~1, 1이면 직교)
+    # 계산된 보상 반환
+    return reward  # 보상 반환
+def gripper_horizontal(  # 그리퍼 수평성 보상 함수
+    env: ManagerBasedRLEnv,  # 환경
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),  # 엔드 이펙터 설정
+) -> torch.Tensor:  # 반환 타입: 토치 텐서
+    """그리퍼가 수평(z축이 아래를 향함)일 때 보상을 준다.
+    그리퍼의 z축이 -z 방향(아래)을 향할수록 보상이 증가한다.
+    - z축이 (0, 0, -1) 방향이면: 보상 = 1.0 (완벽한 수평)
+    - z축이 (0, 0, 1) 방향이면: 보상 = 0.0 (역방향)
+    """
+    # 환경에서 엔드 이펙터 객체 가져오기
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]  # 씬에서 엔드 이펙터 가져오기
+    # 그리퍼의 z축 방향 벡터 (아래쪽을 향해야 함)
+    # 쿼터니언을 회전 행렬로 변환하여 z축 추출
+    # 쿼터니언을 회전 행렬로 변환
+    gripper_quat = ee_frame.data.target_quat_w  # 그리퍼 쿼터니언 (환경 수, 타겟 수, 4)
+    gripper_quat = gripper_quat[:, 0, :]  # 첫 번째 타겟만 선택 (환경 수, 4)
+    ee_rot_matrix = matrix_from_quat(gripper_quat)  # 회전 행렬로 변환 (환경 수, 3, 3)
+    # 회전 행렬의 두 번째 열을 y축으로 추출 (90도 회전)
+    gripper_y_axis = ee_rot_matrix[:, 1, :]  # 회전 행렬의 y축 벡터 추출
+    # 목표 방향 설정: (0, 0, -1) - 아래쪽을 향함
+    target_axis = torch.tensor([0.0, 0.0, -1.0], device=gripper_y_axis.device)  # 목표 벡터 정의
+    # 그리퍼 y축을 정규화 (이미 단위 벡터이지만 안전하게)
+    gripper_y_axis = torch.nn.functional.normalize(gripper_y_axis, dim=-1)  # 벡터 정규화
+    # 두 벡터의 내적 계산 (-1 ~ 1 범위)
+    # 내적이 1에 가까우면 같은 방향 (옆으로 누운 자세)
+    # 내적이 -1에 가까우면 반대 방향
+    dot_product = (gripper_y_axis * target_axis).sum(dim=-1)  # 내적 계산
+    # 내적을 보상으로 변환: -1 ~ 1을 0 ~ 1 범위로
+    # dot = 1 (완벽한 수평) → reward = 1.0
+    # dot = 0 (수직) → reward = 0.0
+    # dot = -1 (역방향) → reward = 0.0
+    reward = torch.clamp(dot_product, min=0.0)  # 내적을 0 이상으로 클램핑하여 보상 계산
+    # 계산된 보상 반환
+    return reward  # 보상 반환
 
 
-def downward_orientation_score(
+def approach_velocity_penalty(
     env: ManagerBasedRLEnv,
-    strictness: float = 2.0,
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-) -> torch.Tensor:
-    """
-    자세 보상: 그리퍼가 수직 아래를 향하는지 평가
-    반환: [0~1] (1.0 = 완벽한 수직)
-    """
-    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    ee_quat = ee_frame.data.target_quat_w[..., 0, :]
-    
-    # Z축 벡터 추출
-    x, y = ee_quat[:, 1], ee_quat[:, 2]
-    z_axis_z = 1.0 - 2.0 * (x * x + y * y)
-    
-    # 점수 변환 (-1:수직 -> 1.0점, 0:수평 -> 0.5점)
-    alignment = torch.clamp((-z_axis_z + 1.0) / 2.0, 0.0, 1.0)
-    
-    # Strictness 적용 (높을수록 엄격함)
-    return torch.pow(alignment, strictness)
-
-
-def approach_and_orient_reward(
-    env: ManagerBasedRLEnv,
-    pregrasp_height: float = 0.10,
-    orientation_strictness: float = 2.0,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("medicine_cabinet"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-) -> torch.Tensor:
-    """
-    [핵심 수정] 거리 보상과 자세 보상의 '가중 합'
-    곱하기(*)를 쓰면 초기에 보상이 0이 되어 학습이 안 됨.
-    더하기(+)를 써서, 자세가 나빠도 접근만 하면 부분 점수를 줌.
-    """
-    dist_rew = approach_pregrasp_pose(
-        env, pregrasp_height, object_cfg, ee_frame_cfg
-    )
-    
-    orient_rew = downward_orientation_score(
-        env, orientation_strictness, ee_frame_cfg
-    )
-    
-    # 거리 60% + 자세 40% 비중
-    # 로봇이 일단 가까이 가는 법을 먼저 배우게 됨
-    return 0.6 * dist_rew + 0.4 * orient_rew
-
-
-def gripper_close_encourage(
-    env: ManagerBasedRLEnv,
-    switch_dist: float = 0.04,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("medicine_cabinet"),
+    distance_threshold: float = 0.15,  # 15cm 이내에서 속도 체크
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """
-    그리퍼 전략: 4cm 밖에서는 열고(Open), 4cm 안에서는 닫아라(Close)
+    """물체에 가까워질수록 빠르게 움직이면 패널티를 준다.
+    충돌을 방지하기 위해 접근 시 속도를 줄이도록 유도한다.
+    
+    Args:
+        env: 환경
+        distance_threshold: 패널티를 시작할 거리 (미터)
+        object_cfg: 물체 설정
+        ee_frame_cfg: 엔드 이펙터 설정
+        robot_cfg: 로봇 설정
+    
+    Returns:
+        패널티 값 (가까울수록, 빠를수록 큰 음수)
     """
     object: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
     
-    # 거리 계산
-    object_pos = object.data.root_pos_w[:, :3]
+    # 물체와 엔드 이펙터 사이의 거리
+    object_pos = object.data.root_pos_w
     ee_pos = ee_frame.data.target_pos_w[..., 0, :]
-    distance = torch.norm(ee_pos - object_pos, dim=1)
+    distance = torch.norm(object_pos - ee_pos, dim=-1)
     
-    # 그리퍼 값 정규화 (0.0 ~ 1.0)
-    gripper_pos = robot.data.joint_pos[:, -4:]
-    gripper_val = torch.mean(gripper_pos, dim=1) / 0.8 # 대략적인 max값으로 나눔
-    gripper_val = torch.clamp(gripper_val, 0.0, 1.0)
+    # 엔드 이펙터의 속도 (joint velocity 기반 근사)
+    # 실제로는 ee frame의 linear velocity를 사용해야 하지만, 
+    # joint velocity의 L2 norm으로 근사
+    joint_vel = robot.data.joint_vel[:, :6]  # 첫 6개 조인트 (arm)
+    velocity_magnitude = torch.norm(joint_vel, dim=-1)
     
-    is_close = distance < switch_dist
+    # 거리가 threshold 이내일 때만 패널티 적용
+    # 거리가 가까울수록 패널티 증가 (거리 역수 개념)
+    distance_factor = torch.clamp(1.0 - distance / distance_threshold, min=0.0)
     
-    # 가까우면 닫을수록 이득, 멀면 열수록 이득
-    close_reward = gripper_val
-    open_reward = 1.0 - gripper_val
+    # 패널티 = 거리 factor * 속도 크기
+    # 가까이 있을 때 빠르게 움직이면 큰 패널티
+    penalty = distance_factor * velocity_magnitude
     
-    reward = torch.where(is_close, close_reward, open_reward)
-    return torch.nan_to_num(reward, 0.0)
-
-
-def lift_success_bonus(
-    env: ManagerBasedRLEnv,
-    lift_height: float = 0.05,
-    gripper_threshold: float = 0.5,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("medicine_cabinet"),
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """
-    최종 성공 보상: 들어올리면 큰 점수
-    """
-    object: RigidObject = env.scene[object_cfg.name]
-    robot: Articulation = env.scene[robot_cfg.name]
-    
-    current_height = object.data.root_pos_w[:, 2]
-    
-    # 초기 높이 저장 및 리셋 처리
-    if not hasattr(env, '_object_initial_height'):
-        env._object_initial_height = current_height.clone()
-        env._last_episode_buf = env.episode_length_buf.clone()
-    else:
-        reset_mask = env.episode_length_buf < env._last_episode_buf
-        if reset_mask.any():
-            env._object_initial_height[reset_mask] = current_height[reset_mask]
-        env._last_episode_buf = env.episode_length_buf.clone()
-    
-    # 성공 조건: 높이 상승 + 그리퍼 닫힘
-    height_diff = current_height - env._object_initial_height
-    is_lifted = height_diff > lift_height
-    
-    gripper_pos = robot.data.joint_pos[:, -4:]
-    is_closed = torch.all(gripper_pos > gripper_threshold, dim=1)
-    
-    success = torch.logical_and(is_lifted, is_closed)
-    return success.float()
-
-
-def object_stability_penalty(
-    env: ManagerBasedRLEnv,
-    velocity_threshold: float = 0.15,
-    safe_distance: float = 0.10,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("medicine_cabinet"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-) -> torch.Tensor:
-    """
-    페널티: 멀리 있는데 물체가 움직이면(쳐서 날리면) 감점
-    """
-    object: RigidObject = env.scene[object_cfg.name]
-    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    
-    object_vel = torch.norm(object.data.root_lin_vel_w[:, :3], dim=1)
-    is_moving_fast = object_vel > velocity_threshold
-    
-    object_pos = object.data.root_pos_w[:, :3]
-    ee_pos = ee_frame.data.target_pos_w[..., 0, :]
-    distance = torch.norm(ee_pos - object_pos, dim=1)
-    is_far = distance > safe_distance
-    
-    invalid = torch.logical_and(is_far, is_moving_fast)
-    return invalid.float()
+    return -penalty  # 음수 패널티로 반환
