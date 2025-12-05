@@ -35,8 +35,10 @@ class MockJointStatePublisher(Node):
         self.all_joint_names = self.robot_joint_names + self.gripper_joint_names
         
         # Current joint positions: 로봇 팔(6) + 그리퍼(4) = 10개
-        self.joint_positions = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # robot arm
-                                         0.0, 0.0, 0.0, 0.0],             # gripper (closed)
+        # 학습 데이터 평균값 근처로 초기화 (normalization 범위 내)
+        # 학습 시 평균: [-0.09, -0.79, -1.22, -0.15, -1.17, 0.45]
+        self.joint_positions = np.array([0.0, -0.8, -1.2, 0.0, -1.2, 0.5,  # robot arm
+                                         0.0, 0.0, 0.0, 0.0],                # gripper (closed)
                                         dtype=np.float32)
         self.joint_velocities = np.zeros(10, dtype=np.float32)
         

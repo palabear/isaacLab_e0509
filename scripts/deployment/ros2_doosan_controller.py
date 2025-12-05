@@ -26,13 +26,23 @@ class DoosanIsaacLabController(Node):
         super().__init__('doosan_isaaclab_controller')
         
         # =====================================================================
-        # 1. JIT 모델 로드
+        # 1. JIT 모델 로드 + Observation Normalization
         # =====================================================================
         model_path = '/home/jiwoo/IsaacLab/logs/rsl_rl/e0509_pick_place/2025-12-05_09-11-46/exported/policy.pt'
+        ckpt_path = '/home/jiwoo/IsaacLab/logs/rsl_rl/e0509_pick_place/2025-12-05_09-11-46/model_2000.pt'
+        
         self.model = torch.jit.load(model_path)
         self.model.eval()
         
+        # Load normalization statistics from checkpoint
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        self.obs_mean = ckpt['model_state_dict']['actor_obs_normalizer._mean'].squeeze().numpy()
+        self.obs_std = ckpt['model_state_dict']['actor_obs_normalizer._std'].squeeze().numpy()
+        
         self.get_logger().info(f'✅ JIT model loaded from: {model_path}')
+        self.get_logger().info(f'✅ Observation normalization loaded from: {ckpt_path}')
+        self.get_logger().info(f'   Obs mean: {self.obs_mean[:5]}...')
+        self.get_logger().info(f'   Obs std:  {self.obs_std[:5]}...')
         
         # =====================================================================
         # 2. 로봇 설정 (E0509 6-DOF 로봇 + 그리퍼 4개 관절)
@@ -53,16 +63,18 @@ class DoosanIsaacLabController(Node):
             0.0, 0.0, 0.0, 0.0              # 그리퍼 4개
         ], dtype=np.float32)
         
-        # 두산 로봇 관절 한계 (라디안, 안전 범위) - 로봇 팔만
-        # 실제 로봇 사양에 맞게 수정 필요!
-        self.joint_lower_limits = np.array([-6.28, -6.28, -2.61, -6.28, -6.28, -6.28])
-        self.joint_upper_limits = np.array([ 6.28,  6.28,  2.61,  6.28,  6.28,  6.28])
+        # 두산 로봇 관절 한계 (라디안, E0509 실제 스펙)
+        # J1,J2,J4,J6: ±360°, J3,J5: ±155°
+        self.joint_lower_limits = np.array([-6.28, -6.28, -2.70, -6.28, -2.70, -6.28])
+        self.joint_upper_limits = np.array([ 6.28,  6.28,  2.70,  6.28,  2.70,  6.28])
         
         # Action scaling factor (Isaac Lab training과 동일: 0.1)
         self.action_scale = 0.1
         
-        # 속도 제한 (rad/s) - 안전을 위해 낮게 설정
-        self.max_joint_velocity = 0.5  # rad/s
+        # 속도 제한 (rad/s) - E0509 스펙 기준으로 안전하게 설정
+        # 실제: J1,J2=2.09, J3=2.62, J4,J5,J6=3.93 rad/s
+        # 안전을 위해 절반으로: 1.0 rad/s
+        self.max_joint_velocity = 1.0  # rad/s
         
         # Robot base frame (물체 위치 변환용)
         # Isaac Lab 학습 환경과 동일한 로봇 위치
@@ -277,9 +289,20 @@ class DoosanIsaacLabController(Node):
             # ================================================================
             # 1. Observation 구성 (Isaac Lab과 동일: 29 dimensions)
             # ================================================================
-            obs = self.build_observation()
+            obs_raw = self.build_observation()
             
             # NaN 체크
+            if np.isnan(obs_raw).any():
+                self.get_logger().error(f'❌ NaN detected in raw observation!')
+                return
+            
+            # ================================================================
+            # 2. Observation Normalization (학습 시와 동일)
+            # ================================================================
+            obs_normalized = (obs_raw - self.obs_mean) / (self.obs_std + 1e-8)
+            obs = obs_normalized  # 정규화된 observation 사용
+            
+            # NaN 체크 (정규화 후)
             if np.isnan(obs).any():
                 self.get_logger().error(f'❌ NaN detected in observation! {obs}')
                 return
@@ -287,7 +310,7 @@ class DoosanIsaacLabController(Node):
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0)  # [1, 29]
             
             # ================================================================
-            # 2. JIT 모델 추론
+            # 3. JIT 모델 추론
             # ================================================================
             with torch.no_grad():
                 raw_action = self.model(obs_tensor).squeeze().cpu().numpy()
@@ -317,7 +340,7 @@ class DoosanIsaacLabController(Node):
                 return
             
             # ================================================================
-            # 3. Action Scaling & Delta Control
+            # 4. Action Scaling & Delta Control
             # ================================================================
             # Isaac Lab의 JointPositionActionCfg와 동일하게 적용
             # action_scale을 곱한 후 현재 위치에 더함 (Delta control)
@@ -328,7 +351,7 @@ class DoosanIsaacLabController(Node):
             target_joint_pos = self.current_joint_pos[:self.num_robot_joints] + scaled_action
             
             # ================================================================
-            # 4. Safety Clipping (관절 한계 및 속도 제한)
+            # 5. Safety Clipping (관절 한계 및 속도 제한)
             # ================================================================
             # 관절 위치 한계
             target_joint_pos = np.clip(
@@ -345,14 +368,14 @@ class DoosanIsaacLabController(Node):
             target_joint_pos = self.current_joint_pos[:self.num_robot_joints] + position_delta
             
             # ================================================================
-            # 5. ROS 2 명령 발행
+            # 6. ROS 2 명령 발행
             # ================================================================
             cmd_msg = Float64MultiArray()
             cmd_msg.data = target_joint_pos.tolist()
             self.cmd_pub.publish(cmd_msg)
             
             # ================================================================
-            # 6. 이전 액션 저장 (다음 observation용)
+            # 7. 이전 액션 저장 (다음 observation용)
             # ================================================================
             # 안전하게 클리핑 (-10 ~ 10 범위)
             self.previous_action = np.clip(raw_action, -10.0, 10.0).astype(np.float32)
@@ -361,9 +384,19 @@ class DoosanIsaacLabController(Node):
             if self.get_clock().now().nanoseconds % 1_000_000_000 < 33_000_000:  # ~1초마다
                 obj_pos_robot = self.world_to_robot_frame(self.object_position_world)
                 self.get_logger().info(
-                    f'Obs: [{obs[0]:.2f}, {obs[1]:.2f}, ...] | '
-                    f'Object(robot): [{obj_pos_robot[0]:.2f}, {obj_pos_robot[1]:.2f}, {obj_pos_robot[2]:.2f}] | '
-                    f'Action: [{raw_action[0]:.2f}, {raw_action[1]:.2f}, ...]'
+                    f'\n=== OBSERVATION (29D) ===\n'
+                    f'  Joint Pos (10): {obs[0:10]}\n'
+                    f'  Joint Vel (10): {obs[10:20]}\n'
+                    f'  Object Pos (3): {obs[20:23]}\n'
+                    f'  Last Action(6): {obs[23:29]}\n'
+                    f'=== CURRENT STATE ===\n'
+                    f'  Current Joint Pos: {self.current_joint_pos}\n'
+                    f'  Default Joint Pos: {self.default_joint_pos}\n'
+                    f'  Object(world): {self.object_position_world}\n'
+                    f'  Object(robot): {obj_pos_robot}\n'
+                    f'=== ACTION ===\n'
+                    f'  Raw: {raw_action}\n'
+                    f'  Scaled: {raw_action * self.action_scale}'
                 )
         
         except Exception as e:

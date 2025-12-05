@@ -31,17 +31,13 @@ class MockObjectDetector(Node):
         """고정된 위치의 물체 발행 (테스트용)"""
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'  # 또는 'world'
+        msg.header.frame_id = 'world'  # World frame
         
-        # 물체 위치 (로봇 앞쪽 0.5m, 왼쪽 0.2m)
-        # 실제로는 카메라에서 받아온 값
+        # 물체 위치 (고정) - Isaac Lab 학습 환경과 동일
+        # medicine_cabinet 초기 위치
         msg.pose.position.x = 0.5
         msg.pose.position.y = -0.2
-        msg.pose.position.z = 0.0
-        
-        # 작은 움직임 시뮬레이션 (선택사항)
-        t = self.counter * 0.1
-        msg.pose.position.x += 0.02 * math.sin(t)
+        msg.pose.position.z = -0.95
         
         msg.pose.orientation.w = 1.0
         

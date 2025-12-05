@@ -17,20 +17,38 @@ def object_ee_distance_separate(
     std_z: float,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    target_height_offset: float = 0.05,  # 물체 위 5cm
 ) -> torch.Tensor:
-    """Reward agent: first reward z-lift, then reward xy positioning."""
+    """Reward agent to reach 5cm above the object center.
+    
+    목표: 물체의 중심에서 Z방향으로 5cm 위 지점
+    """
     object: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    cube_pos_w = object.data.root_pos_w
-    ee_pos_w = ee_frame.data.target_pos_w[..., 0, :]
-    delta = cube_pos_w - ee_pos_w
+    
+    # 물체 위치 (world frame)
+    object_pos_w = object.data.root_pos_w  # (num_envs, 3)
+    
+    # 목표 위치: 물체 중심 + Z방향 5cm
+    target_pos_w = object_pos_w.clone()
+    target_pos_w[:, 2] += target_height_offset  # Z축에 5cm 추가
+    
+    # 엔드 이펙터 위치
+    ee_pos_w = ee_frame.data.target_pos_w[..., 0, :]  # (num_envs, 3)
+    
+    # 목표 위치와 EE 사이의 거리
+    delta = target_pos_w - ee_pos_w
     dx, dy, dz = delta[:, 0], delta[:, 1], delta[:, 2]
+    
     # XY 평면 Gaussian 보상
     reward_xy = torch.exp(-(dx**2 + dy**2) / (2 * std_xy**2))
-    # Z Gaussian 보상 (XY 가까워야 의미 있음)
+    
+    # Z Gaussian 보상
     reward_z = torch.exp(-(dz**2) / (2 * std_z**2))
-    # 최종 보상
+    
+    # 최종 보상 = XY와 Z의 곱
     reward = reward_xy * reward_z
+    
     return reward
 def spoon_gripper_perpendicular(  # 숟가락과 그리퍼 수직 정도 계산 함수
     env: ManagerBasedRLEnv,  # 환경
