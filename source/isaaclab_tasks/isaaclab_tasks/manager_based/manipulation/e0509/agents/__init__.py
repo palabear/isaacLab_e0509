@@ -2,5 +2,3 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-
-"""Agent configurations for e0509 pick and place task."""

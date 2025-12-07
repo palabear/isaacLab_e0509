@@ -1,56 +1,60 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
+#
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Configuration for the e0509 robotic arm with rh_p12_rn gripper."""
+"""Configuration for the Doosan E0509 robot.
 
+The following configurations are available:
+
+* :obj:`E0509_CFG`: Doosan E0509 6-DOF arm with 4-finger mimic gripper
+"""
+
+import os
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
-import pathlib
 
-_current_file = pathlib.Path(__file__).resolve()
-_workspace_root = _current_file.parents[4]
-_meshes_dir = _workspace_root / "meshes"
-_usd_path = str(_meshes_dir / "e0509_model.usda")
+##
+# Configuration
+##
 
 E0509_CFG = ArticulationCfg(
+    prim_path="{ENV_REGEX_NS}/Robot",
     spawn=sim_utils.UsdFileCfg(
-        usd_path=_usd_path,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            max_depenetration_velocity=5.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True,
-            solver_position_iteration_count=32,
-            solver_velocity_iteration_count=8,
-        ),
+        # Use e0509_model.usda from isaaclab_tasks
+        usd_path=os.path.join(os.path.dirname(__file__), "..", "..", "..", "isaaclab_tasks", "isaaclab_tasks", "manager_based", "manipulation", "e0509", "model", "e0509_model.usda"),
+        activate_contact_sensors=True,  # Enable contact sensors for collision detection
     ),
     init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.0),
+        rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos={
             "joint_1": 0.0,
-            "joint_2": -0.5,
-            "joint_3": 0.8,
+            "joint_2": 0.0,
+            "joint_3": 1.5708,  # 90 degrees in radians
             "joint_4": 0.0,
-            "joint_5": -0.3,
+            "joint_5": 1.5708,  # 90 degrees in radians
             "joint_6": 0.0,
+            "rh_.*": 0.0,  # Gripper joints (rh_l1, rh_r1_joint, rh_l2, rh_r2)
         },
     ),
     actuators={
         "arm": ImplicitActuatorCfg(
             joint_names_expr=["joint_[1-6]"],
-            effort_limit=194.0,
-            velocity_limit=1.5,
-            stiffness=800.0,
-            damping=80.0,
+            effort_limit=200.0,
+            velocity_limit=1.57,  # 낮추면 더 느리게 (기본: 3.14 rad/s = 180°/s, 현재: 1.57 = 90°/s)
+            stiffness=800.0,  # 낮추면 부드럽게 (500~1000 권장)
+            damping=60.0,  # 높이면 진동 감소 (40~80 권장)
         ),
         "gripper": ImplicitActuatorCfg(
-            joint_names_expr=["rh_l1", "rh_r1_joint", "rh_l2", "rh_r2"],
-            effort_limit=400.0,  # 200.0 -> 400.0: 2x stronger grip force!
+            joint_names_expr=["rh_.*"],
+            effort_limit=100.0,
             velocity_limit=2.0,
-            stiffness=2000.0,  # 500.0 -> 2000.0: 4x stiffer (firm grasp, no slipping)
-            damping=100.0,  # 50.0 -> 100.0: 2x more stable
+            stiffness=2000.0,
+            damping=100.0,
         ),
     },
 )
+"""Configuration of E0509 robot."""
+
