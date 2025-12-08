@@ -29,9 +29,14 @@ Date: 2025-12-06
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import PoseStamped
-from builtin_interfaces.msg import Duration
+
+# Doosan RT control messages
+try:
+    from dsr_msgs2.msg import ServojRtStream
+except ImportError:
+    print("Warning: dsr_msgs2 not found. Install Doosan ROS2 packages or use Mock mode.")
+    ServojRtStream = None
 
 import torch
 import numpy as np
@@ -66,12 +71,11 @@ class Sim2RealE0509Controller(Node):
     ])
     
     # Velocity limits (rad/s) - conservative for safety
-    # Current: 2.0 rad/s = 114.6 deg/s (quite fast)
-    # Recommended for real robot:
-    #   - Testing: 0.5 rad/s = 28.6 deg/s (very safe)
-    #   - Normal: 1.0 rad/s = 57.3 deg/s (moderate)
-    #   - Fast: 2.0 rad/s = 114.6 deg/s (aggressive)
-    MAX_JOINT_VELOCITY = 2.0  # rad/s
+    # For real robot, start very slow to avoid oscillation:
+    #   - Testing: 0.3 rad/s = 17.2 deg/s (very safe, stable)
+    #   - Normal: 0.5 rad/s = 28.6 deg/s (safe)
+    #   - Fast: 1.0 rad/s = 57.3 deg/s (moderate)
+    MAX_JOINT_VELOCITY = 0.5  # rad/s - Safe speed
     
     # Action limits for clipping (prevents sudden movements)
     MAX_ACTION_CHANGE = 1.0  # Maximum change in action between steps
@@ -148,6 +152,21 @@ class Sim2RealE0509Controller(Node):
             'rh_l1', 'rh_r1_joint', 'rh_l2', 'rh_r2'  # Gripper
         ]
         
+        # Home position - Robot starts here every time
+        # Matches training default position for consistency
+        self.home_joint_pos = np.array([
+            0.0,      # joint_1
+            0.0,      # joint_2
+            1.5708,   # joint_3 (90 degrees)
+            0.0,      # joint_4
+            1.5708,   # joint_5 (90 degrees)
+            0.0,      # joint_6
+            0.0,      # rh_l1 (gripper)
+            0.0,      # rh_r1_joint
+            0.0,      # rh_l2
+            0.0,      # rh_r2
+        ], dtype=np.float32)
+        
         # Default joint positions (from e0509.py)
         # ⚠️ CRITICAL: These must match Isaac Lab training environment!
         self.default_joint_pos = np.array([
@@ -186,25 +205,36 @@ class Sim2RealE0509Controller(Node):
         self.target_orientation = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
         
         # Action scale - Controls robot movement speed
-        # Training used 0.2, but we can scale it for real robot safety:
-        #   - 0.1: Very slow (safe for first tests)
-        #   - 0.2: Slow (training speed)
-        #   - 0.3: Moderate
-        #   - 0.5: Fast (current)
+        # Training used 0.2, but real robot needs careful tuning:
+        #   - 0.05: Very slow and stable (too slow for convergence)
+        #   - 0.1: Slow but steady
+        #   - 0.2: Training speed (original)
         # Lower = slower and safer movements
-        self.action_scale = 0.2  # Start with training speed for safety
+        self.action_scale = 0.2  # Match training speed
         
         # State flags
         self.has_joint_data = False
         self.has_target_data = False
         self.emergency_stop = False
+        
+        # Initialization phase
+        self.is_initialized = False
+        self.initialization_step = 0
+        self.max_init_steps = 300  # 6 seconds at 50Hz to reach home position
+        
+        # Initialization target (always start at home position)
+        self.init_target_pos = self.home_joint_pos.copy()
     
     def _setup_ros2_interfaces(self):
         """Setup ROS2 publishers and subscribers."""
+        # Robot namespace (change if using different namespace)
+        robot_ns = 'dsr01'  # Doosan robot namespace
+        
         # Subscriber: Real robot joint states
+        # Doosan: /dsr01/joint_states
         self.joint_state_sub = self.create_subscription(
             JointState,
-            '/joint_states',
+            f'/{robot_ns}/joint_states',  # Doosan ROS2 driver topic
             self.joint_state_callback,
             10
         )
@@ -217,12 +247,17 @@ class Sim2RealE0509Controller(Node):
             10
         )
         
-        # Publisher: Robot trajectory commands
-        self.trajectory_pub = self.create_publisher(
-            JointTrajectory,
-            '/joint_trajectory_controller/joint_trajectory',
-            10
-        )
+        # Publisher: Doosan Real-time Servo Control
+        # servoj_rt_stream: Real-time joint position control
+        if ServojRtStream is not None:
+            self.servoj_pub = self.create_publisher(
+                ServojRtStream,
+                f'/{robot_ns}/servoj_rt_stream',
+                10
+            )
+        else:
+            self.get_logger().warn('ServojRtStream not available - using mock mode')
+            self.servoj_pub = None
         
         # Control loop timer (50 Hz)
         self.control_timer = self.create_timer(
@@ -287,6 +322,38 @@ class Sim2RealE0509Controller(Node):
         ], dtype=np.float32)
         
         self.has_target_data = True
+    
+    # =========================================================================
+    # Forward Kinematics (for debugging)
+    # =========================================================================
+    
+    def compute_forward_kinematics(self, joint_positions: np.ndarray) -> np.ndarray:
+        """
+        Compute end-effector position using forward kinematics.
+        Simple approximation for E0509 robot.
+        
+        Args:
+            joint_positions: Joint angles in radians [6]
+        
+        Returns:
+            ee_position: End-effector position [x, y, z] in base frame
+        """
+        # E0509 approximate link lengths (in meters)
+        # These are rough estimates - adjust based on actual robot specs
+        L1 = 0.0  # Base height
+        L2 = 0.409  # Link 2 length
+        L3 = 0.367  # Link 3 length  
+        L4 = 0.124  # Link 4+5+6 combined length to EE
+        
+        q1, q2, q3, q4, q5, q6 = joint_positions[:6]
+        
+        # Simplified FK (ignoring wrist orientation)
+        # This is an approximation - real FK would use DH parameters
+        x = (L2 * np.cos(q2) + L3 * np.cos(q2 + q3) + L4 * np.cos(q2 + q3 + q4)) * np.cos(q1)
+        y = (L2 * np.cos(q2) + L3 * np.cos(q2 + q3) + L4 * np.cos(q2 + q3 + q4)) * np.sin(q1)
+        z = L1 + L2 * np.sin(q2) + L3 * np.sin(q2 + q3) + L4 * np.sin(q2 + q3 + q4)
+        
+        return np.array([x, y, z], dtype=np.float32)
     
     # =========================================================================
     # Observation Processing (Sim2Real Critical Section)
@@ -466,26 +533,80 @@ class Sim2RealE0509Controller(Node):
         
         return safe_action
     
-    def publish_trajectory_command(self, target_joint_pos: np.ndarray):
+    def publish_servoj_command(self, target_joint_pos: np.ndarray):
         """
-        Publish trajectory command to real robot.
+        Publish Doosan servoj real-time command.
         
         Args:
-            target_joint_pos (np.ndarray): Target joint positions (10,) - 6 arm + 4 gripper
+            target_joint_pos (np.ndarray): Target joint positions in RADIANS (10,) - 6 arm + 4 gripper
         """
-        msg = JointTrajectory()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = self.JOINT_NAMES
+        if self.servoj_pub is None or ServojRtStream is None:
+            return
         
-        # Create trajectory point
-        point = JointTrajectoryPoint()
-        point.positions = target_joint_pos.tolist()
-        point.velocities = [0.0] * 10  # Let controller handle velocity
-        point.time_from_start = Duration(sec=0, nanosec=int(1e9 / self.CONTROL_FREQUENCY))
+        msg = ServojRtStream()
+        # Doosan servoj_rt_stream expects DEGREES, not radians!
+        # Convert radians to degrees
+        target_deg = target_joint_pos[:6] * 57.2958  # rad to deg
         
-        msg.points = [point]
+        msg.pos = target_deg.tolist()
+        msg.vel = [0.0] * 6  # Use default velocity
+        msg.acc = [0.0] * 6  # Use default acceleration
+        msg.time = 0.0  # Use control loop time
         
-        self.trajectory_pub.publish(msg)
+        self.servoj_pub.publish(msg)
+    
+    # =========================================================================
+    # Initialization Phase
+    # =========================================================================
+    
+    def initialize_robot_position(self):
+        """
+        Move robot to HOME position before starting policy inference.
+        
+        Home position: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        
+        This ensures the robot always starts from the same position every time
+        the controller is launched, regardless of where it was when stopped.
+        """
+        # Check if already at home position (within tolerance)
+        position_error = np.abs(self.current_joint_pos - self.init_target_pos)
+        max_error = np.max(position_error[:6])  # Only check arm joints
+        
+        if max_error < 0.02:  # 0.02 rad ≈ 1.1 degrees
+            self.is_initialized = True
+            self.get_logger().info('✅ Robot at HOME position - Starting policy inference')
+            self.get_logger().info(f'   Home position: [{self.home_joint_pos[0]:.3f}, {self.home_joint_pos[1]:.3f}, '
+                                 f'{self.home_joint_pos[2]:.3f}, {self.home_joint_pos[3]:.3f}, '
+                                 f'{self.home_joint_pos[4]:.3f}, {self.home_joint_pos[5]:.3f}]')
+            return
+        
+        # Gradually move towards home position
+        # Use simple proportional control with very slow speed for safety
+        alpha = 0.02  # Interpolation factor (2% per step = very slow movement)
+        target_pos = self.current_joint_pos + alpha * (self.init_target_pos - self.current_joint_pos)
+        
+        # Publish command
+        self.publish_servoj_command(target_pos)
+        
+        self.initialization_step += 1
+        
+        # Log progress every 1 second
+        if self.initialization_step % 50 == 0:
+            self.get_logger().info(
+                f'🔄 Moving to HOME position... Step {self.initialization_step}/{self.max_init_steps} | '
+                f'Max error: {max_error:.3f} rad ({max_error * 57.3:.1f} deg) | '
+                f'Current: [{self.current_joint_pos[0]:.3f}, {self.current_joint_pos[1]:.3f}, '
+                f'{self.current_joint_pos[2]:.3f}, {self.current_joint_pos[3]:.3f}, '
+                f'{self.current_joint_pos[4]:.3f}, {self.current_joint_pos[5]:.3f}]'
+            )
+        
+        # Safety timeout
+        if self.initialization_step > self.max_init_steps:
+            self.get_logger().warn(
+                f'⚠️  Initialization timeout! Proceeding with current position. '
+                f'Max error: {max_error:.3f} rad ({max_error * 57.3:.1f} deg)'
+            )
+            self.is_initialized = True
     
     # =========================================================================
     # Main Control Loop
@@ -496,6 +617,7 @@ class Sim2RealE0509Controller(Node):
         Main control loop (50 Hz).
         
         Flow:
+            0. Initialize robot to training default position (first time)
             1. Check if sensor data is ready
             2. Build observation from sensors
             3. Compute action using policy
@@ -505,6 +627,11 @@ class Sim2RealE0509Controller(Node):
         """
         # Wait for sensor data
         if not self.has_joint_data:
+            return
+        
+        # Initialization phase: Move to training default position first
+        if not self.is_initialized:
+            self.initialize_robot_position()
             return
         
         # Emergency stop check
@@ -540,8 +667,8 @@ class Sim2RealE0509Controller(Node):
             expanded_action[6:10] = safe_action[6]   # Gripper action (broadcast)
             target_joint_pos = self.current_joint_pos + expanded_action * self.action_scale
             
-            # Step 5: Publish trajectory command to robot
-            self.publish_trajectory_command(target_joint_pos)
+            # Step 5: Publish servoj command to robot
+            self.publish_servoj_command(target_joint_pos)
             
             # Step 6: Update state
             self.previous_action = safe_action.copy()
@@ -553,17 +680,26 @@ class Sim2RealE0509Controller(Node):
                 elapsed = time.time() - self.start_time
                 freq = self.control_step / elapsed if elapsed > 0 else 0
                 
+                # Compute current EE position and distance to target
+                current_ee_pos = self.compute_forward_kinematics(self.current_joint_pos)
+                ee_to_target_dist = np.linalg.norm(current_ee_pos - self.target_position)
+                
                 self.get_logger().info(
                     f'📊 Step {self.control_step:5d} | Freq: {freq:5.1f} Hz | '
                     f'Raw Action: [{action[0]:7.4f}, {action[1]:7.4f}, {action[2]:7.4f}, {action[3]:7.4f}, {action[4]:7.4f}, {action[5]:7.4f}, {action[6]:7.4f}] | '
                     f'Warnings: {self.warning_count}'
                 )
                 self.get_logger().info(
-                    f'    Controller sees: [{self.current_joint_pos[0]:.3f}, {self.current_joint_pos[1]:.3f}, {self.current_joint_pos[2]:.3f}, '
+                    f'    Joint pos: [{self.current_joint_pos[0]:.3f}, {self.current_joint_pos[1]:.3f}, {self.current_joint_pos[2]:.3f}, '
                     f'{self.current_joint_pos[3]:.3f}, {self.current_joint_pos[4]:.3f}, {self.current_joint_pos[5]:.3f}]'
                 )
                 self.get_logger().info(
-                    f'    Observation[0:6] (joint_pos_rel): [{obs[0]:.3f}, {obs[1]:.3f}, {obs[2]:.3f}, {obs[3]:.3f}, {obs[4]:.3f}, {obs[5]:.3f}]'
+                    f'    Current EE: [{current_ee_pos[0]:.3f}, {current_ee_pos[1]:.3f}, {current_ee_pos[2]:.3f}] | '
+                    f'Target: [{self.target_position[0]:.3f}, {self.target_position[1]:.3f}, {self.target_position[2]:.3f}] | '
+                    f'Distance: {ee_to_target_dist:.3f}m'
+                )
+                self.get_logger().info(
+                    f'    Obs joint_pos_rel[0:6]: [{obs[0]:.3f}, {obs[1]:.3f}, {obs[2]:.3f}, {obs[3]:.3f}, {obs[4]:.3f}, {obs[5]:.3f}]'
                 )
         
         except Exception as e:
