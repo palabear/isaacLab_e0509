@@ -30,6 +30,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float64MultiArray
 
 # Doosan RT control messages
 try:
@@ -194,13 +195,13 @@ class Sim2RealE0509Controller(Node):
         
         # Target pose (medicine cabinet position)
         # ⚠️ CRITICAL: Training uses ROBOT BASE FRAME coordinates!
-        # ⚠️ Training range: x=[0.4, 0.6], y=[-0.25, 0.25], z=[0.25, 0.5]
+        # ⚠️ Training range: x=[0.5, 0.6], y=[-0.15, 0.15], z=[0.1, 0.2]
         # 
-        # Home EE position is approximately [0.5, 0.0, 0.4] in base frame
-        # Medicine cabinet target should be within robot's reach
+        # Home EE position is approximately [0.409, 0.0, 0.491] in base frame
+        # Medicine cabinet target should be within robot's reach AND training range
         #
         # For testing, use a reachable target in robot base frame (MUST be in training range!)
-        self.target_position = np.array([0.50, 0.0, 0.35], dtype=np.float32)  # Base frame coordinates
+        self.target_position = np.array([0.55, 0.0, 0.15], dtype=np.float32)  # Base frame, within training range
         # Top-down grasp quaternion (w, x, y, z)
         self.target_orientation = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
         
@@ -255,9 +256,16 @@ class Sim2RealE0509Controller(Node):
                 f'/{robot_ns}/servoj_rt_stream',
                 10
             )
+            self.use_mock_mode = False
         else:
-            self.get_logger().warn('ServojRtStream not available - using mock mode')
-            self.servoj_pub = None
+            self.get_logger().warn('ServojRtStream not available - using mock mode with Float64MultiArray')
+            # Mock mode: use Float64MultiArray instead
+            self.servoj_pub = self.create_publisher(
+                Float64MultiArray,
+                f'/{robot_ns}/servoj_rt_stream_mock',
+                10
+            )
+            self.use_mock_mode = True
         
         # Control loop timer (50 Hz)
         self.control_timer = self.create_timer(
@@ -449,7 +457,7 @@ class Sim2RealE0509Controller(Node):
     # Action Processing & Safety Checks
     # =========================================================================
     
-    def process_action(self, action: np.ndarray) -> np.ndarray:
+    def process_action(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Process policy action and apply safety checks.
         
@@ -463,6 +471,7 @@ class Sim2RealE0509Controller(Node):
         
         Returns:
             safe_action (np.ndarray): Safe action after checks (7,)
+            target_joint_pos (np.ndarray): Target joint positions (10,)
         """
         # 1. Action smoothing (limit sudden changes)
         if len(self.action_history) > 0:
@@ -526,12 +535,12 @@ class Sim2RealE0509Controller(Node):
                 )
         
         # Compute safe action from safe target (collapse gripper joints back to single action)
-        safe_expanded_action = (target_joint_pos - self.current_joint_pos) / self.action_scale
+        safe_expanded_action = (target_joint_pos - self.default_joint_pos) / self.action_scale
         safe_action = np.zeros(7, dtype=np.float32)
         safe_action[0:6] = safe_expanded_action[0:6]  # Arm actions
         safe_action[6] = np.mean(safe_expanded_action[6:10])  # Average gripper joints
         
-        return safe_action
+        return safe_action, target_joint_pos
     
     def publish_servoj_command(self, target_joint_pos: np.ndarray):
         """
@@ -540,20 +549,32 @@ class Sim2RealE0509Controller(Node):
         Args:
             target_joint_pos (np.ndarray): Target joint positions in RADIANS (10,) - 6 arm + 4 gripper
         """
-        if self.servoj_pub is None or ServojRtStream is None:
+        if self.servoj_pub is None:
             return
         
-        msg = ServojRtStream()
-        # Doosan servoj_rt_stream expects DEGREES, not radians!
-        # Convert radians to degrees
-        target_deg = target_joint_pos[:6] * 57.2958  # rad to deg
-        
-        msg.pos = target_deg.tolist()
-        msg.vel = [0.0] * 6  # Use default velocity
-        msg.acc = [0.0] * 6  # Use default acceleration
-        msg.time = 0.0  # Use control loop time
-        
-        self.servoj_pub.publish(msg)
+        if self.use_mock_mode:
+            # Mock mode: publish Float64MultiArray (in degrees)
+            msg = Float64MultiArray()
+            target_deg = target_joint_pos[:6] * 57.2958  # rad to deg
+            msg.data = target_deg.tolist()
+            self.servoj_pub.publish(msg)
+            
+            # DEBUG: Log first few publishes
+            if self.control_step < 5:
+                self.get_logger().info(f'🔊 Publishing to mock (deg): {[f"{x:.1f}" for x in target_deg]}')
+        else:
+            # Real robot: publish ServojRtStream
+            msg = ServojRtStream()
+            # Doosan servoj_rt_stream expects DEGREES, not radians!
+            # Convert radians to degrees
+            target_deg = target_joint_pos[:6] * 57.2958  # rad to deg
+            
+            msg.pos = target_deg.tolist()
+            msg.vel = [0.0] * 6  # Use default velocity
+            msg.acc = [0.0] * 6  # Use default acceleration
+            msg.time = 0.0  # Use control loop time
+            
+            self.servoj_pub.publish(msg)
     
     # =========================================================================
     # Initialization Phase
@@ -659,18 +680,12 @@ class Sim2RealE0509Controller(Node):
                 self.get_logger().info(f'🔍 Policy output (7-dim): {action}')
             
             # Step 3: Apply safety checks and process action
-            safe_action = self.process_action(action)
+            safe_action, target_joint_pos = self.process_action(action)
             
-            # Step 4: Compute target joint positions (expand 7-dim action to 10 joints)
-            expanded_action = np.zeros(10, dtype=np.float32)
-            expanded_action[0:6] = safe_action[0:6]  # Arm actions
-            expanded_action[6:10] = safe_action[6]   # Gripper action (broadcast)
-            target_joint_pos = self.current_joint_pos + expanded_action * self.action_scale
-            
-            # Step 5: Publish servoj command to robot
+            # Step 4: Publish servoj command to robot
             self.publish_servoj_command(target_joint_pos)
             
-            # Step 6: Update state
+            # Step 5: Update state
             self.previous_action = safe_action.copy()
             self.action_history.append(safe_action.copy())
             self.control_step += 1

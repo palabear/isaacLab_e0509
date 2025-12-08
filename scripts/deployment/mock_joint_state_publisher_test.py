@@ -3,7 +3,7 @@
 Mock Joint State Publisher for Testing Sim2Real Controller
 
 This script simulates a robot that follows commands from the controller.
-It subscribes to trajectory commands and publishes resulting joint states.
+It subscribes to ServojRtStream commands and publishes resulting joint states.
 
 Usage:
     python3 mock_joint_state_publisher_test.py
@@ -12,7 +12,7 @@ Usage:
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory
+from std_msgs.msg import Float64MultiArray
 import numpy as np
 
 
@@ -20,14 +20,15 @@ class MockJointStatePublisher(Node):
     def __init__(self):
         super().__init__('mock_joint_state_publisher')
         
-        # Publisher: sends current joint states
-        self.publisher = self.create_publisher(JointState, '/joint_states', 10)
+        # Publisher: sends current joint states (mimic Doosan driver)
+        self.publisher = self.create_publisher(JointState, '/dsr01/joint_states', 10)
         
-        # Subscriber: receives commands from controller
+        # Subscriber: receives ServojRtStream commands from controller
+        # Using Float64MultiArray as a simple alternative to ServojRtStream
         self.subscription = self.create_subscription(
-            JointTrajectory,
-            '/joint_trajectory_controller/joint_trajectory',
-            self.trajectory_callback,
+            Float64MultiArray,
+            '/dsr01/servoj_rt_stream_mock',
+            self.servoj_callback,
             10
         )
         
@@ -58,27 +59,24 @@ class MockJointStatePublisher(Node):
         self.log_interval_state = 100  # Log current state every 100 steps (1 sec)
         
         self.get_logger().info('🤖 Mock Robot Simulator Started')
-        self.get_logger().info(f'   Publishing to: /joint_states')
-        self.get_logger().info(f'   Subscribing to: /joint_trajectory_controller/joint_trajectory')
+        self.get_logger().info(f'   Publishing to: /dsr01/joint_states')
+        self.get_logger().info(f'   Subscribing to: /dsr01/servoj_rt_stream_mock')
         self.get_logger().info(f'   Rate: 100 Hz')
         self.get_logger().info(f'   Joints: {self.joint_names}')
     
-    def trajectory_callback(self, msg: JointTrajectory):
-        """Receive trajectory commands from controller."""
-        if len(msg.points) > 0:
-            # Use the first trajectory point as target
-            point = msg.points[0]
+    def servoj_callback(self, msg: Float64MultiArray):
+        """Receive servoj commands from controller (in DEGREES)."""
+        if len(msg.data) >= 6:
+            # Convert degrees to radians (controller sends in degrees)
+            target_deg = np.array(msg.data[:6])
+            target_rad = target_deg / 57.2958  # deg to rad
             
-            # Map received joint positions to our joint order
-            for i, name in enumerate(msg.joint_names):
-                if name in self.joint_names:
-                    idx = self.joint_names.index(name)
-                    self.target_pos[idx] = point.positions[i]
+            # Update target position for arm joints
+            self.target_pos[:6] = target_rad
             
             # Log received command (only periodically to reduce spam)
             if self.step_count % self.log_interval_target == 0:
-                arm_target = self.target_pos[:6]
-                self.get_logger().info(f'📥 Received target: {[f"{x:.3f}" for x in arm_target]}')
+                self.get_logger().info(f'📥 Received target: {[f"{x:.3f}" for x in target_rad]}')
             
             self.step_count += 1
     
